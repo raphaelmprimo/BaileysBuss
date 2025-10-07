@@ -195,7 +195,7 @@ export const parseProductNode = (productNode: BinaryNode) => {
 	const id = getBinaryNodeChildString(productNode, 'id')!
 
 	const mediaNodes = getBinaryNodeChildren(productNode, 'media')!
-	const imagesNodes = mediaNodes[0].content;
+	const imagesNodes = mediaNodes[0]?.content ?? [];
 
 	const statusInfoNode = getBinaryNodeChild(productNode, 'status_info')!
 
