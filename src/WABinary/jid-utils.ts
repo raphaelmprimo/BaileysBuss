@@ -44,7 +44,7 @@ export const getServerFromDomainType = (initialServer: string, domainType?: WAJI
 			return 'hosted.lid'
 		case WAJIDDomains.WHATSAPP:
 		default:
-			return initialServer
+			return initialServer as JidServer
 	}
 }
 
