@@ -152,10 +152,10 @@ export const toProductNode = (productId: string | undefined, product: ProductCre
 		})
 	}
 
-	if(typeof product.url !== 'undefined') {
+	if (typeof product.url !== 'undefined') {
 		content.push({
 			tag: 'url',
-			attrs: { },
+			attrs: {},
 			content: Buffer.from(product.url)
 		})
 	}
@@ -194,8 +194,8 @@ export const parseProductNode = (productNode: BinaryNode) => {
 	const isHidden = productNode.attrs.is_hidden === 'true'
 	const id = getBinaryNodeChildString(productNode, 'id')!
 
-	const mediaNodes = getBinaryNodeChildren(productNode, 'media')!
-	const imagesNodes = mediaNodes[0]?.content ?? [];
+	const mediaNodes = getBinaryNodeChildren(productNode, 'media')
+	const imagesNodes = mediaNodes[0]?.content ?? []
 
 	const statusInfoNode = getBinaryNodeChild(productNode, 'status_info')!
 
@@ -281,8 +281,8 @@ export const uploadingNecessaryImages = async (
 
 const parseImageUrls = (imgNode: BinaryNode) => {
 	return {
-		requested: getBinaryNodeChildString(imgNode, 'request_image_url')!,
-		original: getBinaryNodeChildString(imgNode, 'original_image_url')!
+		requested: getBinaryNodeChildString(imgNode, 'request_image_url'),
+		original: getBinaryNodeChildString(imgNode, 'original_image_url')
 	}
 }
 
