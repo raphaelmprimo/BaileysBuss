@@ -8,7 +8,7 @@ export * from './WABinary/index'
 export * from './WAM/index'
 export * from './WAUSync/index'
 
-export const BAILEYSBUSS_VERSION = '16.12.2025'
+export const BAILEYSBUSS_VERSION = '2026.01.23'
 
 export type WASocket = ReturnType<typeof makeWASocket>
 export { makeWASocket }
