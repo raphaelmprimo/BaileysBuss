@@ -8,17 +8,25 @@ import {
 	DEF_TAG_PREFIX,
 	INITIAL_PREKEY_COUNT,
 	MIN_PREKEY_COUNT,
-	MIN_UPLOAD_INTERVAL,
 	NOISE_WA_HEADER,
 	PROCESSABLE_HISTORY_TYPES,
+	TimeMs,
 	UPLOAD_TIMEOUT
 } from '../Defaults'
-import type { LIDMapping, SocketConfig } from '../Types'
-import { DisconnectReason } from '../Types'
+import {
+	type LIDMapping,
+	type NewChatMessageCapInfo,
+	QueryIds,
+	ReachoutTimelockEnforcementType,
+	type ReachoutTimelockState,
+	type SocketConfig
+} from '../Types'
+import { DisconnectReason, XWAPaths } from '../Types'
 import {
 	addTransactionCapability,
 	aesEncryptCTR,
 	bindWaitForConnectionUpdate,
+	buildPairingQRData,
 	bytesToCrockford,
 	configureSuccessfulPairing,
 	Curve,
@@ -27,6 +35,7 @@ import {
 	generateMdTagPrefix,
 	generateRegistrationNode,
 	getCodeFromWSError,
+	getCompanionPlatformId,
 	getErrorCodeFromStreamError,
 	getNextPreKeysNode,
 	makeEventBuffer,
@@ -35,7 +44,6 @@ import {
 	signedKeyPair,
 	xmppSignedPreKey
 } from '../Utils'
-import { getPlatformId } from '../Utils/browser-utils'
 import {
 	assertNodeErrorFree,
 	type BinaryNode,
@@ -52,6 +60,7 @@ import {
 import { BinaryInfo } from '../WAM/BinaryInfo.js'
 import { USyncQuery, USyncUser } from '../WAUSync/'
 import { WebSocketClient } from './Client'
+import { executeWMexQuery } from './mex.js'
 
 /**
  * Connects to WA servers and performs:
@@ -76,6 +85,8 @@ export const makeSocket = (config: SocketConfig) => {
 	} = config
 
 	const publicWAMBuffer = new BinaryInfo()
+
+	let serverTimeOffsetMs = 0
 
 	const uqTagId = generateMdTagPrefix()
 	const generateMessageTag = () => `${uqTagId}${epoch++}`
@@ -375,6 +386,8 @@ export const makeSocket = (config: SocketConfig) => {
 	let qrTimer: NodeJS.Timeout
 	let closed = false
 
+	const socketEndHandlers: Array<(error: Error | undefined) => void | Promise<void>> = []
+
 	/** log & process any unexpected errors */
 	const onUnexpectedError = (err: Error | Boom, msg: string) => {
 		logger.error({ err }, `unexpected error in '${msg}'`)
@@ -426,7 +439,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 		logger.trace({ handshake }, 'handshake recv from WA')
 
-		const keyEnc = await noise.processHandshake(handshake, creds.noiseKey)
+		const keyEnc = noise.processHandshake(handshake, creds.noiseKey)
 
 		let node: proto.IClientPayload
 		if (!creds.me) {
@@ -465,28 +478,18 @@ export const makeSocket = (config: SocketConfig) => {
 		return +countChild.attrs.value!
 	}
 
-	// Pre-key upload state management
+	// WAWeb has no time throttle here; the server drives uploads via PreKeyLow notifications.
 	let uploadPreKeysPromise: Promise<void> | null = null
-	let lastUploadTime = 0
 
 	/** generates and uploads a set of pre-keys to the server */
-	const uploadPreKeys = async (count = MIN_PREKEY_COUNT, retryCount = 0) => {
-		// Check minimum interval (except for retries)
-		if (retryCount === 0) {
-			const timeSinceLastUpload = Date.now() - lastUploadTime
-			if (timeSinceLastUpload < MIN_UPLOAD_INTERVAL) {
-				logger.debug(`Skipping upload, only ${timeSinceLastUpload}ms since last upload`)
-				return
-			}
-		}
-
-		// Prevent multiple concurrent uploads
+	const uploadPreKeys = async (count = MIN_PREKEY_COUNT) => {
 		if (uploadPreKeysPromise) {
 			logger.debug('Pre-key upload already in progress, waiting for completion')
 			await uploadPreKeysPromise
+			return
 		}
 
-		const uploadLogic = async () => {
+		const uploadLogic = async (retryCount: number): Promise<void> => {
 			logger.info({ count, retryCount }, 'uploading pre-keys')
 
 			// Generate and save pre-keys atomically (prevents ID collisions on retry)
@@ -495,23 +498,22 @@ export const makeSocket = (config: SocketConfig) => {
 				const { update, node } = await getNextPreKeysNode({ creds, keys }, count)
 				// Update credentials immediately to prevent duplicate IDs on retry
 				ev.emit('creds.update', update)
-				return node // Only return node since update is already used
+				return node
 			}, creds?.me?.id || 'upload-pre-keys')
 
 			// Upload to server (outside transaction, can fail without affecting local keys)
 			try {
 				await query(node)
 				logger.info({ count }, 'uploaded pre-keys successfully')
-				lastUploadTime = Date.now()
 			} catch (uploadError) {
 				logger.error({ uploadError: (uploadError as Error).toString(), count }, 'Failed to upload pre-keys to server')
 
-				// Exponential backoff retry (max 3 retries)
+				// Recurse into uploadLogic; calling uploadPreKeys would await its own in-flight promise.
 				if (retryCount < 3) {
 					const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 10000)
 					logger.info(`Retrying pre-key upload in ${backoffDelay}ms`)
 					await new Promise(resolve => setTimeout(resolve, backoffDelay))
-					return uploadPreKeys(count, retryCount + 1)
+					return uploadLogic(retryCount + 1)
 				}
 
 				throw uploadError
@@ -520,7 +522,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 		// Add timeout protection
 		uploadPreKeysPromise = Promise.race([
-			uploadLogic(),
+			uploadLogic(0),
 			new Promise<void>((_, reject) =>
 				setTimeout(() => reject(new Boom('Pre-key upload timeout', { statusCode: 408 })), UPLOAD_TIMEOUT)
 			)
@@ -632,10 +634,20 @@ export const makeSocket = (config: SocketConfig) => {
 		ws.removeAllListeners('open')
 		ws.removeAllListeners('message')
 
+		signalRepository.close?.()
+
 		if (!ws.isClosed && !ws.isClosing) {
 			try {
 				await ws.close()
 			} catch {}
+		}
+
+		for (const handler of socketEndHandlers) {
+			try {
+				await handler(error)
+			} catch (err) {
+				logger.error({ err }, 'error in socket end handler')
+			}
 		}
 
 		ev.emit('connection.update', {
@@ -646,6 +658,7 @@ export const makeSocket = (config: SocketConfig) => {
 			}
 		})
 		ev.removeAllListeners('connection.update')
+		ev.destroy()
 	}
 
 	const waitForSocketOpen = async () => {
@@ -787,7 +800,7 @@ export const makeSocket = (config: SocketConfig) => {
 						{
 							tag: 'companion_platform_id',
 							attrs: {},
-							content: getPlatformId(browser[1])
+							content: getCompanionPlatformId(browser)
 						},
 						{
 							tag: 'companion_platform_display',
@@ -880,7 +893,7 @@ export const makeSocket = (config: SocketConfig) => {
 			}
 
 			const ref = (refNode.content as Buffer).toString('utf-8')
-			const qr = [ref, noiseKeyB64, identityKeyB64, advB64].join(',')
+			const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, advB64, browser)
 
 			ev.emit('connection.update', { qr })
 
@@ -895,6 +908,7 @@ export const makeSocket = (config: SocketConfig) => {
 	ws.on('CB:iq,,pair-success', async (stanza: BinaryNode) => {
 		logger.debug('pair success recv')
 		try {
+			updateServerTimeOffset(stanza)
 			const { reply, creds: updatedCreds } = configureSuccessfulPairing(stanza, creds)
 
 			logger.info(
@@ -906,6 +920,7 @@ export const makeSocket = (config: SocketConfig) => {
 			ev.emit('connection.update', { isNewLogin: true, qr: undefined })
 
 			await sendNode(reply)
+			void sendUnifiedSession()
 		} catch (error: any) {
 			logger.info({ trace: error.stack }, 'error in pairing')
 			void end(error)
@@ -914,6 +929,7 @@ export const makeSocket = (config: SocketConfig) => {
 	// login complete
 	ws.on('CB:success', async (node: BinaryNode) => {
 		try {
+			updateServerTimeOffset(node)
 			await uploadPreKeysToServerIfRequired()
 			await sendPassiveIq('active')
 
@@ -933,6 +949,7 @@ export const makeSocket = (config: SocketConfig) => {
 		ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
 
 		ev.emit('connection.update', { connection: 'open' })
+		void sendUnifiedSession()
 
 		if (node.attrs.lid && authState.creds.me?.id) {
 			const myLID = node.attrs.lid
@@ -1041,6 +1058,94 @@ export const makeSocket = (config: SocketConfig) => {
 		Object.assign(creds, update)
 	})
 
+	const updateServerTimeOffset = ({ attrs }: BinaryNode) => {
+		const tValue = attrs?.t
+		if (!tValue) {
+			return
+		}
+
+		const parsed = Number(tValue)
+		if (Number.isNaN(parsed) || parsed <= 0) {
+			return
+		}
+
+		const localMs = Date.now()
+		serverTimeOffsetMs = parsed * 1000 - localMs
+		logger.debug({ offset: serverTimeOffsetMs }, 'calculated server time offset')
+	}
+
+	const getUnifiedSessionId = () => {
+		const offsetMs = 3 * TimeMs.Day
+		const now = Date.now() + serverTimeOffsetMs
+		const id = (now + offsetMs) % TimeMs.Week
+		return id.toString()
+	}
+
+	const sendUnifiedSession = async () => {
+		if (!ws.isOpen) {
+			return
+		}
+
+		const node = {
+			tag: 'ib',
+			attrs: {},
+			content: [
+				{
+					tag: 'unified_session',
+					attrs: {
+						id: getUnifiedSessionId()
+					}
+				}
+			]
+		}
+
+		try {
+			await sendNode(node)
+		} catch (error) {
+			logger.debug({ error }, 'failed to send unified_session telemetry')
+		}
+	}
+
+	const registerSocketEndHandler = (handler: (error: Error | undefined) => void | Promise<void>) => {
+		socketEndHandlers.push(handler)
+	}
+
+	/**
+	 * Fetches your account's standing when it comes to restrictions.
+	 * @returns Returns the state of the restrictions.
+	 */
+	const fetchAccountReachoutTimelock = async () => {
+		const queryResult = await executeWMexQuery<{
+			is_active?: boolean
+			time_enforcement_ends?: string
+			enforcement_type: ReachoutTimelockEnforcementType
+		}>({}, QueryIds.REACHOUT_TIMELOCK, XWAPaths.xwa2_fetch_account_reachout_timelock, query, generateMessageTag)
+		const result: ReachoutTimelockState = {
+			isActive: !!queryResult?.is_active,
+			timeEnforcementEnds:
+				queryResult?.time_enforcement_ends && queryResult?.time_enforcement_ends !== '0'
+					? new Date(parseInt(queryResult.time_enforcement_ends, 10) * 1000)
+					: undefined,
+			enforcementType: queryResult?.enforcement_type ?? ReachoutTimelockEnforcementType.DEFAULT
+		}
+		ev.emit('connection.update', { reachoutTimeLock: result })
+		return result
+	}
+
+	/**
+	 * Fetches your account's new chat limits.
+	 * @returns Returns the quota and the usage.
+	 */
+	const fetchNewChatMessageCap = async () => {
+		return executeWMexQuery<NewChatMessageCapInfo>(
+			{ input: { type: 'INDIVIDUAL_NEW_CHAT_MSG' } },
+			QueryIds.MESSAGE_CAPPING_INFO,
+			XWAPaths.xwa2_message_capping_info,
+			query,
+			generateMessageTag
+		)
+	}
+
 	return {
 		type: 'md' as 'md',
 		ws,
@@ -1058,18 +1163,23 @@ export const makeSocket = (config: SocketConfig) => {
 		sendNode,
 		logout,
 		end,
+		registerSocketEndHandler,
 		onUnexpectedError,
 		uploadPreKeys,
 		uploadPreKeysToServerIfRequired,
 		digestKeyBundle,
 		rotateSignedPreKey,
 		requestPairingCode,
+		updateServerTimeOffset,
+		sendUnifiedSession,
 		wamBuffer: publicWAMBuffer,
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
 		sendWAMBuffer,
 		executeUSyncQuery,
-		onWhatsApp
+		onWhatsApp,
+		fetchAccountReachoutTimelock,
+		fetchNewChatMessageCap
 	}
 }
 

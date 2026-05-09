@@ -1,3 +1,4 @@
+import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
 import type {
 	AuthenticationCreds,
@@ -33,6 +34,7 @@ import { aesDecryptGCM, hmacSign } from './crypto'
 import { getKeyAuthor, toNumber } from './generics'
 import { downloadAndProcessHistorySyncNotification } from './history'
 import type { ILogger } from './logger'
+import { buildMergedTcTokenIndexWrite, resolveTcTokenJid } from './tc-token-utils'
 
 type ProcessMessageContext = {
 	shouldProcessHistoryMsg: boolean
@@ -54,6 +56,64 @@ const REAL_MSG_STUB_TYPES = new Set([
 ])
 
 const REAL_MSG_REQ_ME_STUB_TYPES = new Set([WAMessageStubType.GROUP_PARTICIPANT_ADD])
+
+async function storeTcTokensFromHistorySync(
+	chats: Chat[],
+	signalRepository: SignalRepositoryWithLIDStore,
+	keyStore: SignalKeyStoreWithTransaction,
+	logger?: ILogger
+) {
+	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
+
+	const candidates: { storageJid: string; token: Buffer; ts: number; senderTs?: number }[] = []
+	for (const chat of chats) {
+		const ts = chat.tcTokenTimestamp ? toNumber(chat.tcTokenTimestamp) : 0
+		if (chat.tcToken?.length && ts > 0) {
+			const jid = jidNormalizedUser(chat.id!)
+			const storageJid = await resolveTcTokenJid(jid, getLIDForPN)
+			candidates.push({
+				storageJid,
+				token: Buffer.from(chat.tcToken),
+				ts,
+				senderTs: chat.tcTokenSenderTimestamp ? toNumber(chat.tcTokenSenderTimestamp) : undefined
+			})
+		}
+	}
+
+	if (!candidates.length) {
+		return
+	}
+
+	const jids = candidates.map(c => c.storageJid)
+	const existing = await keyStore.get('tctoken', jids)
+	const entries: Record<string, { token: Buffer; timestamp?: string; senderTimestamp?: number }> = {}
+
+	for (const c of candidates) {
+		const existingEntry = existing[c.storageJid]
+		const existingTs = existingEntry?.timestamp ? Number(existingEntry.timestamp) : 0
+		if (existingTs > 0 && existingTs >= c.ts) {
+			continue
+		}
+
+		entries[c.storageJid] = {
+			...existingEntry,
+			token: c.token,
+			timestamp: String(c.ts),
+			...(c.senderTs !== undefined ? { senderTimestamp: c.senderTs } : {})
+		}
+	}
+
+	if (Object.keys(entries).length) {
+		logger?.debug({ count: Object.keys(entries).length }, 'storing tctokens from history sync')
+		try {
+			// Include updated __index so cross-session pruning picks these JIDs up.
+			const indexWrite = await buildMergedTcTokenIndexWrite(keyStore, Object.keys(entries))
+			await keyStore.set({ tctoken: { ...entries, ...indexWrite } })
+		} catch (err) {
+			logger?.warn({ err }, 'failed to store tctokens from history sync')
+		}
+	}
+}
 
 /** Cleans a received message to further processing */
 export const cleanMessage = (message: WAMessage, meId: string, meLid: string) => {
@@ -128,12 +188,24 @@ export const shouldIncrementChatUnread = (message: WAMessage) => !message.key.fr
  * Get the ID of the chat from the given key.
  * Typically -- that'll be the remoteJid, but for broadcasts, it'll be the participant
  */
-export const getChatId = ({ remoteJid, participant, fromMe }: WAMessageKey) => {
-	if (isJidBroadcast(remoteJid!) && !isJidStatusBroadcast(remoteJid!) && !fromMe) {
-		return participant!
+export const getChatId = ({ remoteJid, participant, fromMe }: WAMessageKey): string => {
+	if (!remoteJid) {
+		throw new Boom('Cannot derive chat id: message key is missing remoteJid', {
+			data: { remoteJid, participant, fromMe }
+		})
 	}
 
-	return remoteJid!
+	if (isJidBroadcast(remoteJid) && !isJidStatusBroadcast(remoteJid) && !fromMe) {
+		if (!participant) {
+			throw new Boom('Cannot derive chat id: broadcast message key is missing participant', {
+				data: { remoteJid, fromMe }
+			})
+		}
+
+		return participant
+	}
+
+	return remoteJid
 }
 
 type PollContext = {
@@ -287,19 +359,19 @@ const processMessage = async (
 
 					const data = await downloadAndProcessHistorySyncNotification(histNotification, options, logger)
 
-					// Emit LID-PN mappings from history sync
-					// This is how WhatsApp Web learns mappings for chats with non-contacts
 					if (data.lidPnMappings?.length) {
 						logger?.debug({ count: data.lidPnMappings.length }, 'processing LID-PN mappings from history sync')
-						// eslint-disable-next-line max-depth
-						for (const mapping of data.lidPnMappings) {
-							ev.emit('lid-mapping.update', mapping)
-						}
+						await signalRepository.lidMapping
+							.storeLIDPNMappings(data.lidPnMappings)
+							.catch(err => logger?.warn({ err }, 'failed to store LID-PN mappings from history sync'))
 					}
+
+					await storeTcTokensFromHistorySync(data.chats, signalRepository, keyStore, logger)
 
 					ev.emit('messaging-history.set', {
 						...data,
 						isLatest: histNotification.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND ? isLatest : undefined,
+						chunkOrder: histNotification.chunkOrder,
 						peerDataRequestSessionId: histNotification.peerDataRequestSessionId
 					})
 				}
@@ -349,21 +421,51 @@ const processMessage = async (
 			case proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
 				const response = protocolMsg.peerDataOperationRequestResponseMessage!
 				if (response) {
-					await placeholderResendCache?.del(response.stanzaId!)
 					// TODO: IMPLEMENT HISTORY SYNC ETC (sticker uploads etc.).
-					const { peerDataOperationResult } = response
-					for (const result of peerDataOperationResult!) {
-						const { placeholderMessageResendResponse: retryResponse } = result
+					const peerDataOperationResult = response.peerDataOperationResult || []
+					for (const result of peerDataOperationResult) {
+						const retryResponse = result?.placeholderMessageResendResponse
 						//eslint-disable-next-line max-depth
-						if (retryResponse) {
-							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes!)
-							// wait till another upsert event is available, don't want it to be part of the PDO response message
-							// TODO: parse through proper message handling utilities (to add relevant key fields)
+						if (!retryResponse?.webMessageInfoBytes) {
+							continue
+						}
+
+						//eslint-disable-next-line max-depth
+						try {
+							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes)
+							const msgId = webMessageInfo.key?.id
+							// Retrieve cached original message data (preserves LID details,
+							// timestamps, etc. that the phone may omit in its PDO response)
+							const cachedData = msgId ? await placeholderResendCache?.get<Partial<WAMessage> | true>(msgId) : undefined
+							//eslint-disable-next-line max-depth
+							if (msgId) {
+								await placeholderResendCache?.del(msgId)
+							}
+
+							let finalMsg: WAMessage
+							//eslint-disable-next-line max-depth
+							if (cachedData && typeof cachedData === 'object') {
+								// Apply decoded message content onto cached metadata (preserves LID etc.)
+								cachedData.message = webMessageInfo.message
+								//eslint-disable-next-line max-depth
+								if (webMessageInfo.messageTimestamp) {
+									cachedData.messageTimestamp = webMessageInfo.messageTimestamp
+								}
+
+								finalMsg = cachedData as WAMessage
+							} else {
+								finalMsg = webMessageInfo as WAMessage
+							}
+
+							logger?.debug({ msgId, requestId: response.stanzaId }, 'received placeholder resend')
+
 							ev.emit('messages.upsert', {
-								messages: [webMessageInfo as WAMessage],
+								messages: [finalMsg],
 								type: 'notify',
 								requestId: response.stanzaId!
 							})
+						} catch (err) {
+							logger?.warn({ err, stanzaId: response.stanzaId }, 'failed to decode placeholder resend response')
 						}
 					}
 				}
@@ -492,12 +594,19 @@ const processMessage = async (
 				id: jid,
 				author: message.key.participant!,
 				authorPn: message.key.participantAlt!,
+				authorUsername: message.key.participantUsername!,
 				participants,
 				action
 			})
 		const emitGroupUpdate = (update: Partial<GroupMetadata>) => {
 			ev.emit('groups.update', [
-				{ id: jid, ...update, author: message.key.participant ?? undefined, authorPn: message.key.participantAlt }
+				{
+					id: jid,
+					...update,
+					author: message.key.participant ?? undefined,
+					authorPn: message.key.participantAlt,
+					authorUsername: message.key.participantUsername
+				}
 			])
 		}
 
@@ -506,6 +615,7 @@ const processMessage = async (
 				id: jid,
 				author: message.key.participant!,
 				authorPn: message.key.participantAlt!,
+				authorUsername: message.key.participantUsername!,
 				participant: participant.lid,
 				participantPn: participant.pn,
 				action,
